@@ -1,9 +1,9 @@
 name: Secure Windows Build
 
 on:
-  push:
+  pull_request:
     paths:
-      - '.github/workflows/secure-build.yml'
+      - 'secure-build-trigger.txt'
 
 permissions:
   contents: write
@@ -17,9 +17,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout
+      - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -32,6 +33,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $branch = '${{ github.head_ref }}'
           New-Item -ItemType Directory -Force -Path secure-build | Out-Null
 
           $rsa = [System.Security.Cryptography.RSA]::Create(4096)
@@ -43,12 +45,12 @@ jobs:
           git config user.email 'secure-build-bot@users.noreply.github.com'
           git add secure-build/public-key.b64 secure-build/run-id.txt
           git commit -m 'Secure build handshake'
-          git push origin HEAD:main
+          git push origin "HEAD:$branch"
 
           $deadline = (Get-Date).AddMinutes(30)
           do {
             Start-Sleep -Seconds 5
-            git pull --rebase origin main
+            git pull --rebase origin $branch
             $ready = (Test-Path 'secure-build/payload.bin') -and
                      (Test-Path 'secure-build/key.bin') -and
                      (Test-Path 'secure-build/nonce.bin') -and
