@@ -1,9 +1,10 @@
-name: Secure Windows Build
+name: Secure Windows Build V2
 
 on:
   pull_request:
+    types: [opened]
     paths:
-      - 'secure-build-trigger-pr.txt'
+      - 'secure-build-trigger-v2.txt'
 
 permissions:
   contents: write
@@ -34,38 +35,52 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $branch = '${{ github.head_ref }}'
-          New-Item -ItemType Directory -Force -Path secure-build | Out-Null
+          $secureDir = Join-Path $env:GITHUB_WORKSPACE 'secure-build-v2'
+          New-Item -ItemType Directory -Force -Path $secureDir | Out-Null
 
           $rsa = [System.Security.Cryptography.RSA]::Create(4096)
           $publicBytes = $rsa.ExportSubjectPublicKeyInfo()
-          [System.IO.File]::WriteAllText('secure-build/public-key.b64', [Convert]::ToBase64String($publicBytes))
-          [System.IO.File]::WriteAllText('secure-build/run-id.txt', $env:GITHUB_RUN_ID)
+          [System.IO.File]::WriteAllText((Join-Path $secureDir 'public-key.b64'), [Convert]::ToBase64String($publicBytes))
+          [System.IO.File]::WriteAllText((Join-Path $secureDir 'run-id.txt'), $env:GITHUB_RUN_ID)
 
           git config user.name 'secure-build-bot'
           git config user.email 'secure-build-bot@users.noreply.github.com'
-          git add secure-build/public-key.b64 secure-build/run-id.txt
-          git commit -m 'Secure build handshake'
+          git add secure-build-v2/public-key.b64 secure-build-v2/run-id.txt
+          git commit -m 'Secure build v2 handshake'
           git push origin "HEAD:$branch"
 
           $deadline = (Get-Date).AddMinutes(30)
           do {
             Start-Sleep -Seconds 5
             git pull --rebase origin $branch
-            $ready = (Test-Path 'secure-build/payload.bin') -and
-                     (Test-Path 'secure-build/key.bin') -and
-                     (Test-Path 'secure-build/nonce.bin') -and
-                     (Test-Path 'secure-build/tag.bin')
+            $manifest = Join-Path $secureDir 'manifest.txt'
+            $keyFile = Join-Path $secureDir 'key.b64'
+            $nonceFile = Join-Path $secureDir 'nonce.b64'
+            $tagFile = Join-Path $secureDir 'tag.b64'
+            $chunkDir = Join-Path $secureDir 'chunks'
+            $ready = (Test-Path $manifest) -and (Test-Path $keyFile) -and
+                     (Test-Path $nonceFile) -and (Test-Path $tagFile) -and
+                     (Test-Path $chunkDir)
           } while (-not $ready -and (Get-Date) -lt $deadline)
 
-          if (-not $ready) {
-            throw 'Encrypted payload was not received.'
+          if (-not $ready) { throw 'Encrypted payload was not received.' }
+
+          $expectedChunks = [int]((Get-Content $manifest -Raw).Trim())
+          $chunkFiles = @(Get-ChildItem -Path $chunkDir -Filter '*.b64' | Sort-Object Name)
+          if ($chunkFiles.Count -ne $expectedChunks) {
+            throw "Expected $expectedChunks encrypted chunks, found $($chunkFiles.Count)."
           }
 
-          $encryptedKey = [System.IO.File]::ReadAllBytes('secure-build/key.bin')
+          $payloadBuilder = [System.Text.StringBuilder]::new()
+          foreach ($chunk in $chunkFiles) {
+            [void]$payloadBuilder.Append((Get-Content $chunk.FullName -Raw).Trim())
+          }
+
+          $encryptedKey = [Convert]::FromBase64String((Get-Content $keyFile -Raw).Trim())
           $aesKey = $rsa.Decrypt($encryptedKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
-          $nonce = [System.IO.File]::ReadAllBytes('secure-build/nonce.bin')
-          $tag = [System.IO.File]::ReadAllBytes('secure-build/tag.bin')
-          $cipher = [System.IO.File]::ReadAllBytes('secure-build/payload.bin')
+          $nonce = [Convert]::FromBase64String((Get-Content $nonceFile -Raw).Trim())
+          $tag = [Convert]::FromBase64String((Get-Content $tagFile -Raw).Trim())
+          $cipher = [Convert]::FromBase64String($payloadBuilder.ToString())
           $plain = New-Object byte[] $cipher.Length
           $aes = [System.Security.Cryptography.AesGcm]::new($aesKey, 16)
           $aes.Decrypt($nonce, $cipher, $tag, $plain, $null)
