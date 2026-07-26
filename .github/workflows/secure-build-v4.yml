@@ -1,0 +1,167 @@
+name: Secure Windows Build V4
+
+on:
+  pull_request:
+    types: [opened]
+    paths:
+      - 'secure-build-trigger-v4.txt'
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Secure handshake, receive comments, decrypt and build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $secureDir = Join-Path $env:GITHUB_WORKSPACE 'secure-build-v4'
+          New-Item -ItemType Directory -Force -Path $secureDir | Out-Null
+
+          $rsa = [System.Security.Cryptography.RSA]::Create(4096)
+          $publicBytes = $rsa.ExportSubjectPublicKeyInfo()
+          [System.IO.File]::WriteAllText((Join-Path $secureDir 'public-key.b64'), [Convert]::ToBase64String($publicBytes))
+          [System.IO.File]::WriteAllText((Join-Path $secureDir 'run-id.txt'), $env:GITHUB_RUN_ID)
+
+          git config user.name 'secure-build-bot'
+          git config user.email 'secure-build-bot@users.noreply.github.com'
+          git add secure-build-v4/public-key.b64 secure-build-v4/run-id.txt
+          git commit -m 'Secure build v4 handshake'
+          git push origin "HEAD:$env:HEAD_BRANCH"
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $commentsUrl = "https://api.github.com/repos/$env:REPOSITORY/issues/$env:PR_NUMBER/comments?per_page=100"
+          $deadline = (Get-Date).AddMinutes(30)
+          $meta = $null
+          $parts = @{}
+
+          do {
+            Start-Sleep -Seconds 4
+            $comments = Invoke-RestMethod -Uri $commentsUrl -Headers $headers -Method Get
+            foreach ($comment in $comments) {
+              $body = [string]$comment.body
+              if ($body.StartsWith("SECURE_META_V4`n")) {
+                $meta = $body
+              }
+              if ($body -match '^SECURE_PAYLOAD_V4_(\d{3})\r?\n([A-Za-z0-9+/=]+)$') {
+                $parts[$matches[1]] = $matches[2]
+              }
+            }
+
+            $expected = 0
+            if ($meta -and $meta -match '(?m)^chunks=(\d+)$') {
+              $expected = [int]$matches[1]
+            }
+            $ready = $meta -and ($expected -gt 0) -and ($parts.Count -eq $expected)
+          } while (-not $ready -and (Get-Date) -lt $deadline)
+
+          if (-not $ready) { throw 'Encrypted comment payload was not received completely.' }
+
+          if ($meta -notmatch '(?m)^key=([A-Za-z0-9+/=]+)$') { throw 'Missing encrypted key.' }
+          $encryptedKey = [Convert]::FromBase64String($matches[1])
+          if ($meta -notmatch '(?m)^nonce=([A-Za-z0-9+/=]+)$') { throw 'Missing nonce.' }
+          $nonce = [Convert]::FromBase64String($matches[1])
+          if ($meta -notmatch '(?m)^tag=([A-Za-z0-9+/=]+)$') { throw 'Missing authentication tag.' }
+          $tag = [Convert]::FromBase64String($matches[1])
+          if ($meta -notmatch '(?m)^cipher_sha256=([A-Fa-f0-9]{64})$') { throw 'Missing cipher hash.' }
+          $expectedCipherHash = $matches[1].ToLowerInvariant()
+
+          $builder = [System.Text.StringBuilder]::new()
+          for ($i = 0; $i -lt $expected; $i++) {
+            $key = $i.ToString('000')
+            if (-not $parts.ContainsKey($key)) { throw "Missing part $key." }
+            [void]$builder.Append($parts[$key])
+          }
+          $cipher = [Convert]::FromBase64String($builder.ToString())
+          $actualCipherHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($cipher)).ToLowerInvariant()
+          if ($actualCipherHash -ne $expectedCipherHash) { throw 'Ciphertext SHA-256 mismatch.' }
+
+          $aesKey = $rsa.Decrypt($encryptedKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $plain = New-Object byte[] $cipher.Length
+          $aes = [System.Security.Cryptography.AesGcm]::new($aesKey, 16)
+          $aes.Decrypt($nonce, $cipher, $tag, $plain, $null)
+          $aes.Dispose()
+
+          $archivePath = Join-Path $env:RUNNER_TEMP 'source.tar.xz'
+          [System.IO.File]::WriteAllBytes($archivePath, $plain)
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'source-root'
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { throw '7-Zip is not available on the runner.' }
+          & $sevenZip x $archivePath "-o$env:RUNNER_TEMP" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract xz layer.' }
+          $tarPath = Join-Path $env:RUNNER_TEMP 'source.tar'
+          & $sevenZip x $tarPath "-o$sourceRoot" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract tar layer.' }
+
+          $project = Get-ChildItem -Path $sourceRoot -Recurse -Filter '*.csproj' | Select-Object -First 1
+          if (-not $project) { throw 'No csproj found in decrypted payload.' }
+
+          $publishDir = Join-Path $env:RUNNER_TEMP 'publish'
+          $logPath = Join-Path $env:GITHUB_WORKSPACE 'build-log.txt'
+          dotnet restore $project.FullName 2>&1 | Tee-Object -FilePath $logPath
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet restore failed.' }
+
+          dotnet publish $project.FullName `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $publishDir 2>&1 | Tee-Object -FilePath $logPath -Append
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+
+          $exe = Get-ChildItem -Path $publishDir -Filter '*.exe' | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'No executable was produced.' }
+          $exeHash = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash
+          "Executable: $($exe.Name)" | Add-Content $logPath
+          "ExecutableBytes: $($exe.Length)" | Add-Content $logPath
+          "ExecutableSHA256: $exeHash" | Add-Content $logPath
+
+          $artifactZip = Join-Path $env:GITHUB_WORKSPACE 'AutoboxRepairTool-win-x64.zip'
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $artifactZip -Force
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoboxRepairTool-win-x64
+          path: |
+            AutoboxRepairTool-win-x64.zip
+            build-log.txt
+          if-no-files-found: warn
+          retention-days: 1
