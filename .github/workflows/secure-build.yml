@@ -1,0 +1,111 @@
+name: Secure Windows Build
+
+on:
+  push:
+    paths:
+      - '.github/workflows/secure-build.yml'
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Secure handshake, decrypt and build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path secure-build | Out-Null
+
+          $rsa = [System.Security.Cryptography.RSA]::Create(4096)
+          $publicBytes = $rsa.ExportSubjectPublicKeyInfo()
+          [System.IO.File]::WriteAllText('secure-build/public-key.b64', [Convert]::ToBase64String($publicBytes))
+          [System.IO.File]::WriteAllText('secure-build/run-id.txt', $env:GITHUB_RUN_ID)
+
+          git config user.name 'secure-build-bot'
+          git config user.email 'secure-build-bot@users.noreply.github.com'
+          git add secure-build/public-key.b64 secure-build/run-id.txt
+          git commit -m 'Secure build handshake'
+          git push origin HEAD:main
+
+          $deadline = (Get-Date).AddMinutes(30)
+          do {
+            Start-Sleep -Seconds 5
+            git pull --rebase origin main
+            $ready = (Test-Path 'secure-build/payload.bin') -and
+                     (Test-Path 'secure-build/key.bin') -and
+                     (Test-Path 'secure-build/nonce.bin') -and
+                     (Test-Path 'secure-build/tag.bin')
+          } while (-not $ready -and (Get-Date) -lt $deadline)
+
+          if (-not $ready) {
+            throw 'Encrypted payload was not received.'
+          }
+
+          $encryptedKey = [System.IO.File]::ReadAllBytes('secure-build/key.bin')
+          $aesKey = $rsa.Decrypt($encryptedKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $nonce = [System.IO.File]::ReadAllBytes('secure-build/nonce.bin')
+          $tag = [System.IO.File]::ReadAllBytes('secure-build/tag.bin')
+          $cipher = [System.IO.File]::ReadAllBytes('secure-build/payload.bin')
+          $plain = New-Object byte[] $cipher.Length
+          $aes = [System.Security.Cryptography.AesGcm]::new($aesKey, 16)
+          $aes.Decrypt($nonce, $cipher, $tag, $plain, $null)
+          $aes.Dispose()
+
+          $zipPath = Join-Path $env:RUNNER_TEMP 'source.zip'
+          [System.IO.File]::WriteAllBytes($zipPath, $plain)
+          $sourceDir = Join-Path $env:RUNNER_TEMP 'source'
+          if (Test-Path $sourceDir) { Remove-Item -Recurse -Force $sourceDir }
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $sourceDir)
+
+          $project = Get-ChildItem -Path $sourceDir -Recurse -Filter '*.csproj' | Select-Object -First 1
+          if (-not $project) { throw 'No csproj found in decrypted payload.' }
+
+          $publishDir = Join-Path $env:RUNNER_TEMP 'publish'
+          $logPath = Join-Path $env:GITHUB_WORKSPACE 'build-log.txt'
+          dotnet restore $project.FullName 2>&1 | Tee-Object -FilePath $logPath
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet restore failed.' }
+
+          dotnet publish $project.FullName `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $publishDir 2>&1 | Tee-Object -FilePath $logPath -Append
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+
+          $artifactZip = Join-Path $env:GITHUB_WORKSPACE 'AutoboxRepairTool-win-x64.zip'
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $artifactZip -Force
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoboxRepairTool-win-x64
+          path: |
+            AutoboxRepairTool-win-x64.zip
+            build-log.txt
+          if-no-files-found: warn
+          retention-days: 1
