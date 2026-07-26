@@ -1,10 +1,10 @@
-name: Secure Windows Build V2
+name: Secure Windows Build V3
 
 on:
   pull_request:
     types: [opened]
     paths:
-      - 'secure-build-trigger-v2.txt'
+      - 'secure-build-trigger-v3.txt'
 
 permissions:
   contents: write
@@ -35,7 +35,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $branch = '${{ github.head_ref }}'
-          $secureDir = Join-Path $env:GITHUB_WORKSPACE 'secure-build-v2'
+          $secureDir = Join-Path $env:GITHUB_WORKSPACE 'secure-build-v3'
           New-Item -ItemType Directory -Force -Path $secureDir | Out-Null
 
           $rsa = [System.Security.Cryptography.RSA]::Create(4096)
@@ -45,8 +45,8 @@ jobs:
 
           git config user.name 'secure-build-bot'
           git config user.email 'secure-build-bot@users.noreply.github.com'
-          git add secure-build-v2/public-key.b64 secure-build-v2/run-id.txt
-          git commit -m 'Secure build v2 handshake'
+          git add secure-build-v3/public-key.b64 secure-build-v3/run-id.txt
+          git commit -m 'Secure build v3 handshake'
           git push origin "HEAD:$branch"
 
           $deadline = (Get-Date).AddMinutes(30)
@@ -86,13 +86,19 @@ jobs:
           $aes.Decrypt($nonce, $cipher, $tag, $plain, $null)
           $aes.Dispose()
 
-          $zipPath = Join-Path $env:RUNNER_TEMP 'source.zip'
-          [System.IO.File]::WriteAllBytes($zipPath, $plain)
-          $sourceDir = Join-Path $env:RUNNER_TEMP 'source'
-          if (Test-Path $sourceDir) { Remove-Item -Recurse -Force $sourceDir }
-          [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $sourceDir)
+          $archivePath = Join-Path $env:RUNNER_TEMP 'source.tar.xz'
+          [System.IO.File]::WriteAllBytes($archivePath, $plain)
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'source-root'
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { throw '7-Zip is not available on the runner.' }
+          & $sevenZip x $archivePath "-o$env:RUNNER_TEMP" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract xz layer.' }
+          $tarPath = Join-Path $env:RUNNER_TEMP 'source.tar'
+          & $sevenZip x $tarPath "-o$sourceRoot" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract tar layer.' }
 
-          $project = Get-ChildItem -Path $sourceDir -Recurse -Filter '*.csproj' | Select-Object -First 1
+          $project = Get-ChildItem -Path $sourceRoot -Recurse -Filter '*.csproj' | Select-Object -First 1
           if (-not $project) { throw 'No csproj found in decrypted payload.' }
 
           $publishDir = Join-Path $env:RUNNER_TEMP 'publish'
