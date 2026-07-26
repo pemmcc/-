@@ -3,7 +3,7 @@ name: Secure Windows Build
 on:
   pull_request:
     paths:
-      - 'secure-build-trigger.txt'
+      - 'secure-build-trigger-pr.txt'
 
 permissions:
   contents: write
